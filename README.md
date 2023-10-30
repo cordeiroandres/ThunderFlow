@@ -5,4 +5,10 @@ This code estimates electric vehicle (EV) battery consumption and speed based so
 This tool has different options to do the calculation, it has two important methods, you can upload a dataset with coordinates and time intervals or put just a simply trajectory to do the estimation.
 
 # For example
-![Tutorial](https://github.com/cordeiroandres/EV-battery-calculator/Images/Tutorial1.png)
+![Tutorial](https://github.com/cordeiroandres/EV-battery-calculator/blob/main/Images/Tutorial1.png)
+
+![Tutorial](https://github.com/cordeiroandres/EV-battery-calculator/blob/main/Images/Tutorial2.png)
+
+![Tutorial](https://github.com/cordeiroandres/EV-battery-calculator/blob/main/Images/Tutorial3.png)
+
+![Tutorial](https://github.com/cordeiroandres/EV-battery-calculator/blob/main/Images/Tutorial4.png)
