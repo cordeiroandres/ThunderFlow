@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Oct 26 15:45:22 2023
-
 @author: deiro
 """
 
@@ -18,6 +16,9 @@ import zipfile
 import glob
 import rasterio
 from rasterio.merge import merge
+
+import polyline as pc
+
 
 from ConstantsConsumption import (
     COP,
@@ -72,24 +73,38 @@ from ConstantsConsumption import (
 
 global SRC,DEM_DATA
 
-def check_required_columns(dataframe):
+def check_required_columns(dataframe,MapMatching=None):
+    required_columns = True
     for column in COLUMNS_REQ:
         if column not in dataframe.columns:
             print('You need this column to do the calculation',column)
-            return False
+            required_columns = False
+            return required_columns,dataframe
+    try: 
+        dataframe['lat'] = dataframe['lat'].astype(float)
+        dataframe['lon'] = dataframe['lon'].astype(float)
+    except ValueError:
+        print("The column 'lon' on 'lat' does not contain numerical values.")
+        required_columns = False
+        return required_columns,dataframe
     
     if 'uid' not in dataframe.columns:
         dataframe['uid'] = 0
-    if 'user_progressive' not in dataframe.columns:
-        dataframe['user_progressive'] = 0
+    if MapMatching:
+        srtm_assign(dataframe)
+    else:        
+        if 'elevation' not in dataframe.columns:
+            srtm_assign(dataframe)        
     
     try:
         dataframe['ts'] = pd.to_datetime(dataframe['ts'], format='%Y-%m-%d %H:%M:%S.%f')
     except ValueError:
         print("The column 'ts' does not contain datetime values.")
-        return False
+        required_columns = False
+        return required_columns,dataframe
+    
         
-    return True
+    return required_columns,dataframe
     
 def check_columns(dataframe, column_req):
     if column_req in dataframe.columns:
@@ -125,16 +140,23 @@ def add_last_row(df,temporal_thr=1200):
     df = pd.concat([df,last_row])
     return df
 
-def time_difference(df,time_thr=1200):
+def time_difference(df,time_thr=1200,SegmentationExists=False):
     prev_id = df['uid'].shift(1).fillna(0)
-    prev_date = df['ts'].shift(1).fillna(pd.Timestamp('1900'))        
-    conditions = [((df['uid'].values == prev_id) & ((df['ts']-prev_date).dt.total_seconds() <= time_thr))]
-    choices = [(df['ts'] - prev_date).dt.total_seconds()]    
+    prev_date = df['ts'].shift(1).fillna(pd.Timestamp('1900'))
+    if SegmentationExists:
+        prev_user_progressive = df['user_progressive'].shift(1).fillna(-1)        
+        conditions = [((df['uid'].values == prev_id) & (df['user_progressive'] == prev_user_progressive))]
+        choices = [(df['ts'] - prev_date).dt.total_seconds()]           
+    else:
+                
+        conditions = [((df['uid'].values == prev_id) & ((df['ts']-prev_date).dt.total_seconds() <= time_thr))]
+        choices = [(df['ts'] - prev_date).dt.total_seconds()]    
+
     df['ts_dif']= np.select(conditions,choices,default=0)
     
     return df
 
-def create_trajectory(df,temporal_thr=1200,spatial_thr=0,minpoints=4):          
+def create_trajectory(df,temporal_thr,spatial_thr,minpoints):          
     traj_new = list()    
     traj = list()
     first_iteration = True  
@@ -184,14 +206,14 @@ def create_trajectory(df,temporal_thr=1200,spatial_thr=0,minpoints=4):
                
     return traj_new
 
-def create_trajectories(df,temporal_thr,spatial_thr,minpoints):     
-    if check_required_columns(df):            
-        df = add_last_row(df)    
-        df = time_difference(df,temporal_thr)
-        df['user_progressive'] = 0
-        tj_new = create_trajectory(df,temporal_thr,spatial_thr,minpoints)          
-        df_traj = pd.DataFrame(tj_new)
-        return df_traj
+def create_trajectories(df,temporal_thr=1200,spatial_thr=10,minpoints=4):     
+    df = add_last_row(df)    
+    df = time_difference(df,temporal_thr)
+    df['user_progressive'] = 0
+    tj_new = create_trajectory(df,temporal_thr,spatial_thr,minpoints)          
+    df_traj = pd.DataFrame(tj_new)
+    return df_traj
+
 
 #Functions for downloading the elevation tiles
 def srtm3_tile(lon, lat):
@@ -313,7 +335,6 @@ def speed_calculation(df):
     choices = [(df['distance']/df['ts_dif'])]
     df['speed']= np.select(conditions,choices,default=0) 
     return df
-
 
 def time_calculation(df):
     conditions = [(df['speed'] > 0)] 
@@ -502,7 +523,7 @@ def MapMatching_Valhalla(df):
     r = requests.post(url, data=data, headers=headers)    
     return r
 
-def MapMatching_traj(df):
+def MapMatching_Valhalla_traj(df):
     SuccessMapMatching = False
     try:
         r  = MapMatching_Valhalla(df)   
@@ -567,53 +588,266 @@ def MapMatching_traj(df):
             
             return SuccessMapMatching,df_mpr            
         else:
-            print(r)
+            #print(r)
             return SuccessMapMatching,df            
 
     except Exception as e:
         print('Error at map matching ',e)
-        return df 
+        return SuccessMapMatching,df 
 
+def MapMatching_OSRM (lat,lon,lat1,lon1):
+    osrm_request = ""                
+    osrm_request = "{},{};".format(lon, lat)+"{},{}".format(lon1, lat1)
+    osmrm_base = "http://localhost:5000/route/v1/driving/"        
+    osrm_call = requests.get (osmrm_base + osrm_request, params =  {"annotations":"true","overview": "full"} )    
+    
+    return osrm_call
 
+def add_time(traj_new):   
+    is_first = True
+    for i,row in traj_new.iterrows():                
+        if is_first:
+            ts = traj_new.at[i, 'ts'] 
+            is_first = False
+        else:           
+            ts = ts + pd.to_timedelta(traj_new.at[i, 'ts_dif'], unit='s') 
+            traj_new.at[i, 'ts'] = ts
+    
+    return traj_new
 
+def MapMatching_seq_osrm(df):
+    df_mpr = []
+    uid = df.uid[0]
+    ts = df.ts[0]
+    vel = df.speed[0]
+    osrm_call = MapMatching_OSRM(df.lat[0],df.lon[0],df.lat[1],df.lon[1])
+    if osrm_call.status_code == 200: 
+        geometry =  osrm_call.json()['routes'][0]['geometry']
+        #waypoints = pc.PolylineCodec().decode(geometry) 
+        waypoints = pc.decode(geometry)
+        #nodes = osrm_call.json()['routes'][0]['legs'][0]['annotation']['nodes']
+        speed = osrm_call.json()['routes'][0]['legs'][0]['annotation']['speed']
+        time = osrm_call.json()['routes'][0]['legs'][0]['annotation']['duration']
+        dist = osrm_call.json()['routes'][0]['legs'][0]['annotation']['distance']        
+        index = ['lat','lon']
+        df_mpr = pd.DataFrame(waypoints, columns=index)
+        time = [t+0.1 for t in time]
+        speed.insert(0, vel)
+        time.insert(0, 0)
+        dist.insert(0, 0)
+        df_mpr['speed'] = speed
+        df_mpr['speed'] = df_mpr["speed"]/3.6
+        #df_mpr.at[0,'speed'] = vel        
+        df_mpr['ts_dif'] = time     
+        df_mpr['distance'] = dist
+        #df_mpr['nodes'] = nodes
+        df_mpr['type'] = 'interpolated'    
+        df_mpr['type'][0] ='matched'
+        df_mpr['type'][len(df_mpr)-1] ='matched'
+        df_mpr['PtOrigin'] = np.where(df_mpr['type'].values == 'interpolated',False,True)
+        df_mpr['uid'] = uid
+        df_mpr['ts'] = ts
+        df_mpr['ts'] = pd.to_datetime(df_mpr['ts'])
+        df_mpr = add_time(df_mpr)
+        
+    
+    return df_mpr
 
-def consumption_traj(df,GotElevation=False,DoMapMatching=False):
+def MapMatching_OSRM_traj(dfa):
+    dfinal = []
+    MapMatchingOsrm=False
+    for i in range(len(dfa)-1):
+        df = []    
+        dfo = []     
+        dfo = dfa.iloc[i:i+2]     
+        dfo = dfo.reset_index(drop=True)    
+        df = MapMatching_seq_osrm(dfo) 
+        dfinal.append(df)    
+    
+    if len(dfinal)>0:
+        MapMatchingOsrm=True
+    df_osrm = pd.concat(dfinal, ignore_index=True)     
+    df_osrm = df_osrm.drop_duplicates(subset=['lat', 'lon'], keep='first',ignore_index=True)
+    return MapMatchingOsrm,df_osrm
+    
+
+def consumption_traj(df,MapMatching=None):
     column_req = 'ts_dif'
     tsdif = check_columns(df, column_req)
     column_req = 'speed'
     speed = check_columns(df, column_req)
-    con = 0
     SuccessMapMatching = False
-    if check_required_columns(df):    
-        if not tsdif:
-            df = time_difference(df)
-            
-        if not speed:
-            df = speed_calculation(df)
-        else:    
-            df['speed'] = df['speed']/3.6
+    MapMatchingValhalla = False
+    MapMatchingOSRM = False
+    
+    if not tsdif:
+        df = time_difference(df)        
+    if not speed:
+        df = speed_calculation(df)
+    else:    
+        df['speed'] = df['speed']/3.6
+    
+    if MapMatching=='valhalla':       
+        MapMatchingValhalla,df = MapMatching_Valhalla_traj(df)
+        SuccessMapMatching = MapMatchingValhalla        
+    
+    df = distance_difference(df,MapMatchingValhalla)   
+    if MapMatchingValhalla:            
+        df = time_calculation(df) 
         
-        if DoMapMatching:
-            srtm_assign(df)
-            SuccessMapMatching,df=MapMatching_traj(df)
-        else:                
-            if not GotElevation:
-                srtm_assign(df)
-        
-        df_mpr = distance_difference(df,DoMapMatching)   
-        
-        
-        
-        if DoMapMatching & SuccessMapMatching:            
-            df_mpr = time_calculation(df_mpr) 
-        
-        df_mpr = calculate_acceleration(df_mpr)        
-        df_mpr = assign_elevation(df_mpr)
-        df_mpr = calculate_slope(df_mpr)
-        df_mpr = calculate_consumption(df_mpr)        
-        con = round(df_mpr['con'].sum(),3)
+    if MapMatching=='osrm':       
+        MapMatchingOSRM,df = MapMatching_OSRM_traj(df)
+        SuccessMapMatching = MapMatchingOSRM
+    
+    df_mpr = calculate_acceleration(df)        
+    df_mpr = assign_elevation(df_mpr)
+    df_mpr = calculate_slope(df_mpr)
+    df_mpr = calculate_consumption(df_mpr)           
 
-    return con,df_mpr,SuccessMapMatching
+    return df_mpr,SuccessMapMatching
+    
+def calculation_consumption_traj(dj,
+                            lst,
+                            MapMatching,
+                            ResultsByTrajectory,
+                            ResultsByWayId,
+                            ResultsByDetailPoints):                                
+    lst_wayid = []
+    lst_traj = []
+    lst_points = []
+    
+    for i in range(len(lst)-1):    
+           dfa=dj.iloc[lst[i]:lst[i+1]].reset_index(drop=True)    
+           try:               
+               djr,SuccessMapMatching = consumption_traj(dfa,MapMatching)
+               if len(djr) > 0:                                          
+                   if ResultsByTrajectory:
+                       dist = round(djr['distance'].sum()/1000, 3) 
+                       con = round(djr['con'].sum(),3)
+                       dfj=[djr.uid[0],djr.user_progressive[0],djr.ts[0],djr.ts[len(djr)-1],dist,con ]                            
+                       lst_traj.append(dfj)   
+                
+                   if MapMatching=='valhalla':
+                       if SuccessMapMatching:
+                           group_wayid = djr.groupby('way_id',sort=False).agg({'con': 'sum','distance':'sum'}).reset_index()                        
+                           group_wayid['distance'] = group_wayid['distance']/1000
+                           group_wayid['distance'] = group_wayid['distance'].round(3)
+                           group_wayid['con'] = group_wayid['con'].round(3)        
+                           
+                           way_id_list = group_wayid.values.tolist()
+                           do = [djr.uid[0],djr.user_progressive[0],djr.ts[0],djr.ts[len(djr)-1], way_id_list]        
+                           lst_wayid.append(do) 
+                       
+                   if ResultsByDetailPoints:                       
+                       compressed_row = djr.to_json()
+                       lst_points.append(compressed_row)
+                   
+           except Exception as e: 
+               print("Error ",e)
+    if ResultsByTrajectory:
+        if len(lst_traj)>0:
+            col = ['uid','user_progressive','start_date','end_date','distance','consumption']        
+            lst_traj = pd.DataFrame(lst_traj, columns=col)
+    if MapMatching=='valhalla':
+        if len(lst_wayid)>0:
+            col = ['uid','user_progressive','start_date','end_date','way_id_list']        
+            lst_wayid = pd.DataFrame(lst_wayid,columns=col)            
+    
+        
+    return lst_traj,lst_wayid,lst_points
+               
+  
+def consumption(df,
+                CreateTrajectories=None,                               
+                temporal_thr=1200,
+                spatial_thr=50,
+                minpoints=4,
+                MapMatching=None,
+                ResultsByTrajectory=True,
+                ResultsByWayId=False,
+                ResultsByDetailPoints=False
+                ): 
+    required_columns,df=check_required_columns(df,MapMatching)
+          
+    if required_columns:
+        column_req = 'user_progressive'
+        user_progressive = check_columns(df, column_req)
+        
+        if CreateTrajectories:                
+            df = create_trajectories(df,temporal_thr,spatial_thr,minpoints)            
+        else:
+            if user_progressive:
+                df = time_difference(df,SegmentationExists=True)
+            else:
+                df = create_trajectories(df,temporal_thr,spatial_thr,minpoints)
+                
+        df_traj  = distance_difference(df)
+        lst_inter = df_traj[df_traj['distance'] == 0.0].index.tolist()          
+        lst_inter.append(len(df_traj))
+        
+        lst_traj,lst_wayid,lst_pts=calculation_consumption_traj(df_traj,
+                                                                lst_inter,
+                                                                MapMatching,
+                                                                ResultsByTrajectory,
+                                                                ResultsByWayId,
+                                                                ResultsByDetailPoints)
+               
+        if MapMatching=='valhalla':
+            if ResultsByTrajectory:
+                if ResultsByWayId:
+                    if ResultsByDetailPoints:
+                        return lst_traj,lst_wayid,lst_pts
+                    else:
+                        return lst_traj,lst_wayid
+                else:
+                    if ResultsByDetailPoints:
+                        return lst_traj,lst_pts
+                    else:
+                        return lst_traj
+            else:
+                if ResultsByWayId:
+                    if ResultsByDetailPoints:
+                        return lst_wayid,lst_pts
+                    else:
+                        return lst_wayid
+                else:
+                    if ResultsByDetailPoints:
+                        return lst_pts 
+        else:                                 
+            if ResultsByTrajectory:
+                if ResultsByDetailPoints:
+                    return lst_traj,lst_pts
+                else:
+                    return lst_traj
+            else:
+                if ResultsByDetailPoints:
+                    return lst_pts
+                
+       
+    
+       
+"""    
+def calculate_consumption_traj(df,
+                               temporal_thr=1200,
+                               spatial_thr=50,
+                               minpoints=4,
+                               GotElevation=False,
+                               DoMapMatching=False):        
+    if check_required_columns(df):
+        dj = create_trajectories(df,temporal_thr,spatial_thr,minpoints)
+        df_traj  = distance_difference(dj)
+        lst_inter = df_traj[df_traj['distance'] == 0.0].index.tolist()          
+        lst_inter.append(len(df_traj))
+        lst_traj,lst_wayid = calculation_consumption(df_traj, lst_inter,GotElevation,DoMapMatching)
+        
+        col = ['uid','user_progressive','start_date','end_date','distance','consumption']        
+        data_traj = pd.DataFrame(lst_traj, columns=col)
+        if DoMapMatching:
+            col = ['uid','user_progressive','start_date','end_date','way_id_list']        
+            data_wayid = pd.DataFrame(lst_wayid,columns=col)
+            return data_traj,data_wayid
+        
+        return data_traj,lst_wayid
     
 def calculation_consumption(dj,lst,GotElevation=False,DoMapMatching=False):    
     lst_wayid = []
@@ -642,25 +876,75 @@ def calculation_consumption(dj,lst,GotElevation=False,DoMapMatching=False):
                print("Error ",e)
     return lst_traj,lst_wayid
                
+def consumption_traj(df,GotElevation=False,DoMapMatching=False):
+    column_req = 'ts_dif'
+    tsdif = check_columns(df, column_req)
+    column_req = 'speed'
+    speed = check_columns(df, column_req)
+    con = 0
+    SuccessMapMatching = False
     
-def calculate_consumption_traj(df,temporal_thr=1200,spatial_thr=50,minpoints=4,GotElevation=False,DoMapMatching=False):        
-    if check_required_columns(df):
-        dj = create_trajectories(df,temporal_thr,spatial_thr,minpoints)
-        df_traj  = distance_difference(dj)
-        lst_inter = df_traj[df_traj['distance'] == 0.0].index.tolist()          
-        lst_inter.append(len(df_traj))
-        lst_traj,lst_wayid = calculation_consumption(df_traj, lst_inter,GotElevation,DoMapMatching)
+    if not tsdif:
+        df = time_difference(df)
         
-        col = ['uid','user_progressive','start_date','end_date','distance','consumption']        
-        data_traj = pd.DataFrame(lst_traj, columns=col)
-        if DoMapMatching:
-            col = ['uid','user_progressive','start_date','end_date','way_id_list']        
-            data_wayid = pd.DataFrame(lst_wayid,columns=col)
-            return data_traj,data_wayid
-        
-        return data_traj,lst_wayid
-        
-        
-        
-       
+    if not speed:
+        df = speed_calculation(df)
+    else:    
+        df['speed'] = df['speed']/3.6
     
+    if DoMapMatching:
+        srtm_assign(df)
+        SuccessMapMatching,df=MapMatching_traj(df)
+    else:                
+        if not GotElevation:
+            srtm_assign(df)
+    
+    df_mpr = distance_difference(df,DoMapMatching)   
+    
+    
+    
+    if DoMapMatching & SuccessMapMatching:            
+        df_mpr = time_calculation(df_mpr) 
+    
+    df_mpr = calculate_acceleration(df_mpr)        
+    df_mpr = assign_elevation(df_mpr)
+    df_mpr = calculate_slope(df_mpr)
+    df_mpr = calculate_consumption(df_mpr)        
+    con = round(df_mpr['con'].sum(),3)
+
+    return con,df_mpr,SuccessMapMatching
+    
+def calculation_consumption(dj,
+                            lst,
+                            MapMatching,
+                            ResultsByTrajectory,
+                            ResultsByWayId,
+                            ResultsByDetailPoints):                                
+    lst_wayid = []
+    lst_traj = []
+    lst_points = []
+    
+    for i in range(len(lst)-1):    
+           dfa=dj.iloc[lst[i]:lst[i+1]].reset_index(drop=True)    
+           try:               
+               con,djr,SuccessMapMatching = consumption_traj(dfa,GotElevation,DoMapMatching)
+               if len(djr) > 0:
+                   dist = round(djr['distance'].sum()/1000, 3) 
+                   #con = round(djr['con'].sum(),3)
+                   dfj=[djr.uid[0],djr.user_progressive[0],djr.ts[0],djr.ts[len(djr)-1],dist,con ]                            
+                   lst_traj.append(dfj)    
+                                          
+                   if DoMapMatching & SuccessMapMatching:
+                       group_wayid = djr.groupby('way_id',sort=False).agg({'con': 'sum','distance':'sum'}).reset_index()                        
+                       group_wayid['distance'] = group_wayid['distance']/1000
+                       group_wayid['distance'] = group_wayid['distance'].round(3)
+                       group_wayid['con'] = group_wayid['con'].round(3)        
+                       
+                       way_id_list = group_wayid.values.tolist()
+                       do = [djr.uid[0],djr.user_progressive[0],djr.ts[0],djr.ts[len(djr)-1], way_id_list]        
+                       lst_wayid.append(do)                    
+                   
+           except Exception as e: 
+               print("Error ",e)
+    return lst_traj,lst_wayid
+"""
