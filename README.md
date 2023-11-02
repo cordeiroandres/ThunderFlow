@@ -7,7 +7,7 @@ This tool has different options to do the calculation, it has two important meth
 ## Installation
 
 You can install this package using pip:
-
+[![pip install ThunderFlowPro](https://img.shields.io/badge/pip%20install-ThunderFlowPro-brightgreen)](https://pypi.org/project/ThunderFlowPro/)
 
 ```bash
 pip install ThunderFlowPro
