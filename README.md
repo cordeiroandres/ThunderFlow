@@ -4,6 +4,32 @@ This code estimates electric vehicle (EV) battery consumption and speed based so
 
 This tool has different options to do the calculation, it has two important methods, you can upload a dataset with coordinates and time intervals or put just a simply trajectory to do the estimation.
 
+## Installation
+
+You can install this package using pip:
+
+
+```bash
+pip install ThunderFlowPro
+```
+
+## Usage
+```python
+import ThunderFlowPro as T
+
+# Example usage
+
+lst_traj=T.consumption(df,
+                CreateTrajectories=True,                               
+                temporal_thr=1200,
+                spatial_thr=50,
+                minpoints=4,
+                MapMatching='valhalla',
+                ResultsByTrajectory=True
+                )
+```
+
+
 # For example
 ![Tutorial](https://github.com/cordeiroandres/EV-battery-calculator/blob/main/Images/Tutorial1.png)
 
