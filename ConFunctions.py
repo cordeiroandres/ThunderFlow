@@ -73,6 +73,664 @@ from ConstantsConsumption import (
 
 global SRC,DEM_DATA
 
+#FUNCTIONS OF EMOBPY
+#FUNCTIONS FOR MOTOR INPUT POWER Pm_IN
+def _cop_and_target_temp(T_out):
+        """        
+        Args:
+            T_out ([float]): [description]
+        Returns:
+            [type]: [description]
+        """        
+        if T_out < TARGET_TEMP["heating"]:
+            T_targ = TARGET_TEMP["heating"]
+            cop = COP["heating"]
+            #flag = 1
+        elif T_out > TARGET_TEMP["cooling"]:
+            T_targ = TARGET_TEMP["cooling"]
+            cop = COP["cooling"]
+            #flag = -1
+        else:
+            T_targ = None
+            cop = 1
+            #flag = 0
+        return T_targ, cop #,flag
+
+@njit(cache=True,fastmath=True)
+def rolling_resistance_coeff_M1(temp, v, road_type=0):
+    """
+    Returns calculated rolling resistance coeff for M1.
+    Args:
+        temp (float): Temperature in degree celsius. (the ambient temperature)
+        v (float): Speed in km/h.
+        road_type (int, optional): 
+                0: ordinary car tires on concrete, new asphalt, cobbles small new, coeff: 0.01 - 0.015 (Default)
+                1: car tires on gravel - rolled new, on tar or asphalt, coeff: 0.02
+                2: car tires on cobbles  - large worn, coeff: 0.03
+                3: car tire on solid sand, gravel loose worn, soil medium hard, coeff: 0.04 - 0.08
+                4: car tire on loose sand, coeff: 0.2 - 0.4
+            reference: Wang, J.; Besselink, I.; Nijmeijer, H. Electric Vehicle Energy Consumption Modelling and
+            Prediction Based on Road Information.
+            World Electr. Veh. J. 2015, 7, 447-458. https://doi.org/10.3390/wevj7030447
+    
+    Returns:
+        int: Rolling resistance coefficient
+    """
+    factor = [1, 1.5, 2.2, 4, 20]
+    return (1.9e-6 * temp ** 2 - 2.1e-4 * temp + 0.013 +
+            5.4e-5 * v) * factor[road_type]
+
+@njit(cache=True,fastmath=True)
+def prollingresistance(rolling_resistance_coeff,
+                       vehicle_mass,
+                       g,                       
+                       slop_angle=0):
+    """
+    Calculates and returns polling resistance.
+    Args:
+        rolling_resistance_coeff ([type]): [description]
+        vehicle_mass ([type]): [description]
+        g ([type]): [description]
+        v ([type]): [description]
+        slop_angle (int, optional): [description]. Defaults to 0.
+
+    Returns:
+        float: Polling resistance.
+    """
+    #return rolling_resistance_coeff * vehicle_mass * g * np.cos(np.deg2rad(slop_angle)) * v
+    return rolling_resistance_coeff * vehicle_mass * g * np.cos(slop_angle) 
+    #return rolling_resistance_coeff * vehicle_mass * g * np.cos(np.deg2rad(slop_angle))
+
+@njit(cache=True,fastmath=True)
+def pairdrag(air_density, frontal_area, drag_coeff, v, wind_speed=0):
+    """
+    Reference: Wang, J.; Besselink, I.; Nijmeijer, H. Electric Vehicle Energy Consumption Modelling and Prediction
+    Based on Road Information.
+    World Electr. Veh. J. 2015, 7, 447-458. https://doi.org/10.3390/wevj7030447
+    Args:
+        air_density ([type]): [description]
+        frontal_area ([type]): [description]
+        drag_coeff ([type]): [description]
+        v ([type]): [description]
+        wind_speed (int, optional): Wind speed in direction of the vehicle.. Defaults to 0.
+    Returns:
+        float: [description]
+    """    
+    return 0.5 * air_density * frontal_area * drag_coeff * (v - wind_speed)**2
+    
+@njit(cache=True,fastmath=True)
+def p_gravity(vehicle_mass, g, slop_angle=0):
+    """
+    Args:
+        vehicle_mass ([type]): [description]
+        g ([type]): [description]
+        v ([type]): [description]
+        slop_angle (int, optional): [description]. Defaults to 0.
+    Returns:
+        [type]: [description]
+    """
+    #return vehicle_mass * g * np.sin(np.deg2rad(slop_angle)) * v
+    return vehicle_mass * g * np.sin(slop_angle)
+    #return vehicle_mass * g * np.sin(np.deg2rad(slop_angle))
+
+@njit(cache=True,fastmath=True)
+def pinertia(inertial_mass, vehicle_mass, acceleration):
+    """
+    Args:
+        inertial_mass ([type]): [description]
+        vehicle_mass ([type]): [description]
+        acceleration ([type]): [description]
+        v ([type]): [description]
+    Returns:
+        [type]: [description]
+    """
+    return (vehicle_mass + inertial_mass) * acceleration
+
+@njit(cache=True,fastmath=True)
+def p_wheel(p_rollingresistance, p_airdrag, p_gravity, p_inertia):
+    """
+    Args:
+        p_rollingresistance ([type]): [description]
+        p_airdrag ([type]): [description]
+        p_gravity ([type]): [description]
+        p_inertia ([type]): [description]
+    Returns:
+        [type]: [description]
+    """
+    return p_rollingresistance + p_airdrag + p_gravity + p_inertia
+
+@njit(cache=True,fastmath=True)
+def p_motorout(p_wheel, transmission_eff):
+    """
+    Args:
+        p_wheel ([type]): [description]
+        transmission_eff ([type]): [description]
+    Returns:
+        [type]: [description]
+    """    
+    #only_positive = p_wheel
+    
+    if p_wheel < 0.0 or transmission_eff == 0.0:
+        result = 0.0
+    else:
+        result = p_wheel / transmission_eff
+    
+    return result
+
+#@njit(cache=True,fastmath=True)
+def _get_efficiency(load_fraction, load_fraction_values, column_values):
+    """    
+    Gets a one-dimensional linear interpolation of given arguments.
+
+    Args:
+        load_fraction ([type]): [description]
+        load_fraction_values ([type]): [description]
+        column_values ([type]): [description]
+
+    Returns:
+        float: Efficiency.
+    """
+    return np.interp(load_fraction, load_fraction_values, column_values)
+
+@njit(cache=True,fastmath=True)
+def p_motorin(p_motor_out, motor_eff):
+    """
+    Args:
+        p_motor_out ([type]): [description]
+        motor_eff ([type]): [description]
+    Returns:
+        [type]: [description]
+    """  
+    
+    if(motor_eff == 0  or np.isnan(motor_eff)):
+        result=0
+    else:
+        result = p_motor_out / motor_eff
+    
+    return result
+
+
+#FUNCTIONS FOR GENERATOR OUTPUT POWER Pg_OUT
+@njit(cache=True,fastmath=True)
+def EFFICIENCYregenerative_braking(acceleration):
+    """        
+    Args:
+        acceleration ([type]): [description]
+    Returns:
+        [type]: [description]
+    """    
+    if acceleration >= 0.0:        
+        result = 0.0
+    else:
+        result = (np.exp(0.0411 / np.abs(acceleration))) ** (-1)
+
+    return result    
+
+@njit(cache=True,fastmath=True)
+def p_generatorin(p_wheel, transmission_eff, regenerative_braking_eff):
+    """        
+    Args:
+        p_wheel ([type]): [description]
+        transmission_eff ([type]): [description]
+        regenerative_braking_eff ([type]): [description]
+    Returns:
+        [type]: [description]
+    """
+    
+    only_negative = p_wheel
+
+    if only_negative > 0.0:
+        only_negative = 0.0
+
+    result = only_negative * transmission_eff * regenerative_braking_eff
+
+    return result
+
+@njit(cache=True,fastmath=True)
+def p_generatorout(p_generator_in, generator_eff):
+    """        
+    Args:
+        p_generator_in ([type]): [description]
+        generator_eff ([type]): [description]
+    Returns:
+        [type]: [description]
+    """
+    result = p_generator_in * generator_eff
+    
+    return result
+
+
+#FUNCTIONS FOR ELECTRICAL POWER (HEATING/COOLING) DEVICES
+@njit(cache=True,fastmath=True)
+#@staticmethod
+def calc_dew_point(T, H):
+        """
+        Calculate dew point.
+        Args:
+            t (float): air temperature in degree Celsius.
+            h (float): Relative humidity in percent.
+
+        Returns:
+            array:
+        """
+        Td = (
+                243.04
+                * (np.log(H / 100) + ((17.625 * T) / (243.04 + T)))
+                / (17.625 - np.log(H / 100) - ((17.625 * T) / (243.04 + T)))
+        )
+        return Td
+
+@njit(cache=True,fastmath=True)
+def calc_vapor_pressure(t):
+    """
+    Calculate vapor pressure.
+
+    Args:
+        t (array): Dew point or air temperature in degree Celsius.
+
+    Returns:
+        array: Vapor pressure array
+    """
+    T = t  # dew point or air temp degC
+    E = 6.11 * np.power(
+        10, ((7.5 * T) / (237.3 + T))
+    )  # saturated  vapor pressure (mb) if t is dewpoint
+    return E
+    
+
+@njit(cache=True,fastmath=True)
+def humidair_density(t, p, h):
+            """
+            Calculate humid air density.
+    
+            Args:
+                t (array): Temperature in degree Celsius.
+                p (array): Pressure in mbar.
+                h (array, optional): Humidity in percent. Defaults to None.    
+            Raises:
+                Exception: Dp or h is missing.
+
+            Returns:
+                array: Humid air density.
+            """  
+            #pv = calc_vapor_pressure(calc_dew_point(t, h))  # mbar 
+            T = calc_dew_point(t, h)
+            pv = 6.11 * np.power( 10, ((7.5 * T) / (237.3 + T)))
+            
+            #pd = calc_dry_air_partial_pressure(p, pv)  # mbar
+            pdd = p - pv  # mbar
+    
+            Pv = 100 * pv  # convert mb   => Pascals
+            Pd = 100 * pdd  # convert mb   => Pascals
+    
+            Rd = 287.05  # specific gas constant for dry air [J/(kgK)]
+            Rv = 461.495  # specific gas constant for water vapour [J/(kgK)]
+            T = t + 273.15  # convert degC => degK
+    
+            AD = Pd / (Rd * T) + Pv / (Rv * T)  # density [kg/m3]
+            return AD
+
+#@delay
+@njit(cache=True,fastmath=True)
+def q_ventilation(density_air, flow_air, Cp_air, temp_air):
+    """        
+    Density_air: kg/m3, Flow_air: m3/s, Cp_air: J/(kg*K), Temp_air: degC
+    Args:
+        density_air ([type]): [description]
+        flow_air ([type]): [description]
+        Cp_air ([type]): [description]
+        temp_air ([type]): [description]
+
+    Returns:
+        [type]: [description]
+    """
+    temp_kelvin = temp_air + 273.15
+    return density_air * flow_air * Cp_air * temp_kelvin
+
+@njit(cache=True,fastmath=True)
+def htc_air_out(vehicle_speed, limit=5):
+    """        
+    Args:
+        vehicle_speed ([type]): [description]
+        limit (int, optional): [description]. Defaults to 5.
+    Returns:
+        [type]: [description]
+    """    
+    if vehicle_speed < limit:
+        h = 6.14 * np.power(limit, 0.78)
+    else:
+        h = 6.14 * np.power(vehicle_speed, 0.78)
+    return h
+
+
+@njit(cache=True,fastmath=True)
+def resistances(zone_layer, zone_area, layer_conductivity, layer_thickness,
+                vehicle_speed, air_cabin_heat_transfer_coef):
+    """[summary]        
+    Args:
+        zone_layer ([type]): [description]
+        zone_area ([type]): [description]
+        layer_conductivity ([type]): [description]
+        layer_thickness ([type]): [description]
+        vehicle_speed ([type]): [description]
+        air_cabin_heat_transfer_coef ([type]): [description]
+
+    Returns:
+        [type]: [description]
+    """
+    #x_z = zone_layer * layer_thickness
+    
+    h_i = air_cabin_heat_transfer_coef
+    #FORMULA (26)
+    h_o = htc_air_out(vehicle_speed)
+    #FORMULA (24)
+    #R_c = x_z / layer_conductivity
+    #S_rc = R_c.sum(axis=1)
+    
+    R_hz = 1 / h_i + S_RC + 1 / h_o
+    R_z = zone_area / R_hz
+    return R_z.sum()
+
+#@delay
+@njit(cache=True,fastmath=True)
+def q_transfer(zone_layer,
+               zone_area,
+               layer_conductivity,
+               layer_thickness,
+               t_air_cabin,
+               t_air_out,
+               vehicle_speed,
+               air_cabin_heat_transfer_coef=10):
+    """
+    Args:
+        zone_layer ([type]): [description]
+        zone_area ([type]): [description]
+        layer_conductivity ([type]): [description]
+        layer_thickness ([type]): [description]
+        t_air_cabin ([type]): [description]
+        t_air_out ([type]): [description]
+        vehicle_speed ([type]): [description]
+        air_cabin_heat_transfer_coef (int, optional): [description]. Defaults to 10.
+
+    Returns:
+        [type]: [description]
+    """
+    t_air_cabin_K = t_air_cabin + 273.15
+    t_air_out_K = t_air_out + 273.15        
+    R = resistances(zone_layer, zone_area, layer_conductivity, layer_thickness,
+                    vehicle_speed, air_cabin_heat_transfer_coef)    
+    return (t_air_cabin_K - t_air_out_K) * R
+
+@njit(cache=True,fastmath=True)
+def cp(T):    
+    """
+    Args:
+        T ([type]): [description]
+
+    Returns:
+        [type]: [description]
+    """
+    return np.interp(T, T_RNG, CP_RNG)
+
+
+
+@njit(cache=True,fastmath=True)
+def vehicle_mass(curb_weight, passengers_weight):
+    """
+    Calculates and returns vehicle mass.
+    Args:
+        curb_weight (float): Empty weight of the vehicle.
+        passengers_weight (float): Passengers weight.
+    Returns:
+        float: Vehicle mass.
+    """
+    return curb_weight + passengers_weight
+
+
+
+@njit(cache=True,fastmath=True)
+def qhvac(
+          T_out,
+          T_targ,
+          cabin_volume,
+          flow_air,
+          zone_layer,
+          zone_area,
+          layer_conductivity,
+          layer_thickness,
+          vehicle_speed,
+          Q_sensible=70,
+          persons=1,
+          P_out=1013.25,
+          h_out=60,
+          air_cabin_heat_transfer_coef=10):
+    """
+    Q indexes 0: Qtotal, 1: Q_in_per, 2: Q_in_vent, 3: Q_out_vent, 4: Q_tr
+
+    Args:
+        D (method): [description]
+        T_out (float): [description]
+        T_targ (int): [description]
+        cabin_volume (float): [description]
+        flow_air (float): [description]
+        zone_layer (ndarray): [description]
+        zone_area (ndarray): [description]
+        layer_conductivity (ndarray): [description]
+        layer_thickness (ndarray): [description]
+        vehicle_speed (ndarray): [description]
+        Q_sensible (int, optional): [description]. Defaults to 70.
+        persons (int, optional): [description]. Defaults to 1.
+        P_out (float, optional): [description]. Defaults to 1013.25.
+        h_out (int, optional): [description]. Defaults to 60.
+        air_cabin_heat_transfer_coef (int, optional): [description]. Defaults to 10.
+
+    Returns:
+        [type]: [description]
+    """
+    hd= humidair_density(T_out, P_out, h=h_out)
+    mass_flow_in = flow_air * hd
+
+    t_diff = T_out - T_targ  # positive if cooling, negative if heating
+    
+    if t_diff > 0:
+        plus = -0.05
+        sign = -1  # cooling
+    else:
+        plus = 0.05
+        sign = 1  # heating
+    
+    t_1 = T_out
+    t = T_out + plus
+    if sign == -1:
+        if np.round(t, 2) > T_targ:
+            t += plus
+        else:
+            t = T_targ
+    else:
+        if np.round(t, 2) < T_targ:
+            t += plus
+        else:
+            t = T_targ
+           
+    
+    #FORMULA (27)    
+    Q_in_per = Q_sensible * persons   
+    
+    #to = time.time()
+    
+    Q_in_vent = q_ventilation(hd, flow_air,
+                              cp(T_out), T_out)
+    #print("Q_in_vent= ",time.time() - to)    
+    #t0 = time.time()
+    
+    hud=humidair_density(t, P_out, h=h_out)
+    
+    Q_out_vent = q_ventilation(hud,mass_flow_in / hud, cp(t),t)
+    #print("Q_out_vent= ",time.time() - t0)    
+    
+    #t0 = time.time()    
+    
+    Q_tr = q_transfer(zone_layer, zone_area, layer_conductivity,
+                      layer_thickness, t, T_out, vehicle_speed,
+                      air_cabin_heat_transfer_coef)  
+    
+    #print("q_transfer= ",time.time() - t0)    
+    
+    #t0 = time.time()
+          
+    Q = cabin_volume * hud * cp(t) * (
+            t - t_1) - Q_in_per - Q_in_vent + Q_out_vent + Q_tr
+    #print("Q= ",time.time() - t0)    
+
+              
+    return Q
+
+
+
+
+
+
+
+
+def consumeEmobPy(v,acc,slop_angle,temp):    
+    #Get the target temperature and other information
+    targ_temp, cop = _cop_and_target_temp(temp)        
+    #print("targ_temp=",targ_temp," cop=",cop)
+        
+    #FORMULA (8)
+    f_r = rolling_resistance_coeff_M1(temp, v)        
+    #print("f_r=",f_r)
+    
+    #Calculates and returns polling resistance. 
+    #FORMULA (3)
+    P_rol = prollingresistance(f_r, VEHICLE_MASS, GRAVITY,slop_angle)
+    #print("P_rol=",P_rol)
+        
+    #FORMULA (2)
+    P_air = pairdrag(AIR_DENSITY, FRONTAL_AREA, DRAG_COEFFICIENT, v, WIND_SPEED)
+    #print("P_air=",P_air)
+    
+    #FORMULA (4)
+    P_g = p_gravity(VEHICLE_MASS, GRAVITY, slop_angle)     
+    #print("P_g =",P_g)
+    
+    #FORMULA (5)
+    P_ine = pinertia(M_I, VEHICLE_MASS, acc)
+    #print("P_ine =",P_ine)
+    
+    #FORMULA (1) 
+    F_te = p_wheel(P_rol, P_air, P_g, P_ine)    
+    #print("F_te =",F_te)       
+    
+    #FORMULA (9)
+    if F_te > 0:
+        P_wheel = F_te * v
+    else:
+        P_wheel = 0    
+    
+    #FORMULA (10)
+    P_m_o = p_motorout(P_wheel, TRANSMISSION_EFF)
+    #print("P_m_o =",P_m_o)  
+    
+    #FORMULA (12)
+    Load_p_m = P_m_o / P_MAX
+    #print("Load_p_m =",Load_p_m)
+    
+    #FORMULA (13)        
+    n_mot = _get_efficiency(Load_p_m,LOAD_FRACTION,MOTOR)
+    #print("n_mot =",n_mot)
+    
+    #FORMULA (11)
+    P_M_In = p_motorin(P_m_o, n_mot)
+    #print("P_M_In =",P_M_In)  
+
+#************************************************************************************************       
+    #FORMULA (16)
+    n_rb = EFFICIENCYregenerative_braking(acc)
+    #print("n_rb =",n_rb)        
+    
+    #FORMULA (14)
+    if F_te < 0:
+        P_wheel = np.abs(F_te) * v
+    
+    #FORMULA (15)    
+    P_gen_in = p_generatorin(P_wheel, TRANSMISSION_EFF, n_rb)
+    #print("P_gen_in =",P_gen_in)
+ 
+    #FORMULA (18)   
+    Load_p_g = P_gen_in / P_MAX
+    #print("Load_p_g =",Load_p_g)
+    
+    #FORMULA (19)            
+    n_gen = _get_efficiency(np.abs(Load_p_g),LOAD_FRACTION,GENERATOR)
+    #print("n_gen =",n_gen)
+                
+    #FORMULA ()
+    P_g_out = p_generatorout(P_gen_in, n_gen)
+    #print("P_g_out =",P_g_out)  
+
+#************************************************************************************************
+    
+    #FORMULA (29)
+    P_aux = AUXILIARY_POWER
+    #print("P_aux =",P_aux)
+
+#************************************************************************************************   
+    #FORMULAS (20 - 27)
+
+    Q_hvac = qhvac(                        
+                        temp, 
+                        targ_temp,
+                        CABIN_VOLUME,
+                        AIR_FLOW,
+                        ZONE_LAYERS,
+                        ZONE_SURFACE,
+                        LAYER_CONDUCTIVITY,
+                        LAYER_THICKNESS,
+                        v,
+                        Q_sensible=PASSENGER_SENSIBLE_HEAT,
+                        persons=PASSENGER_NR,
+                        air_cabin_heat_transfer_coef=AIR_CABIN_HEAT_TRANSFER_COEF,
+                    )
+    #print("Q_hvac=",Q_hvac)
+    
+    #Q_hvac=243.45352
+    #FORMULA (28)
+    #P_hvac = np.abs(Q_hvac[:, 0]) / cop
+    P_hvac = np.abs(Q_hvac) / cop
+    #print("cop=",cop)
+    
+#************************************************************************************************        
+    
+    # section to calculate consumption
+    #FORMULA (30)
+    P_all = P_M_In - P_g_out + P_aux + P_hvac 
+    #P_all = P_M_In - P_g_out #+ P_hvac
+    #print('P_M_In=',P_M_In,'P_g_out=',P_g_out,'P_aux=',P_aux,'P_hvac=',P_hvac )
+    #print("P_all=",P_all)
+    
+    
+    #FORMULA (31)
+    if P_all >= 0.0:
+        P_bat = P_all / (BATTERY_DISCHARGE_EFF)        
+    else:
+        P_bat = P_all * (BATTERY_CHARGE_EFF)
+
+    #print("P_bat_actual=",P_bat)
+    
+    #consumption = P_bat_actual / 1000 / 3600  # kWh  
+    # Calcolo DeltaSoC
+    kWh2Ws = 3600*1000
+    consumption = P_bat/(EBATCAP*kWh2Ws)
+    #consumption = P_bat/(kWh2Ws)
+    
+    #print("consumption=",consumption)
+        
+    return consumption
+
+#End of EmobPy 
+
+
 def check_required_columns(dataframe,MapMatching=None):
     required_columns = True
     for column in COLUMNS_REQ:
